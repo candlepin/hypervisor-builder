@@ -14,7 +14,7 @@ setup(
         "hypervisor.virt.libvirt",
         "hypervisor.virt.kubevirt",
     ],
-    url="https://github.com/VirtwhoQE/hypervisor-builder",
+    url="https://github.com/candlepin/hypervisor-builder",
     license="GPL-3.0",
     author="",
     author_email="",
