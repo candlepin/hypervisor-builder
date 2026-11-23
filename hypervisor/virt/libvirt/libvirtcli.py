@@ -3,8 +3,9 @@ import random
 import re
 import time
 
-from hypervisor import logger
+from hypervisor import FailException, logger
 from hypervisor.ssh import SSHConnect
+from hypervisor.virt import first_ipv4
 
 
 class LibvirtCLI:
@@ -156,23 +157,40 @@ class LibvirtCLI:
 
     def guest_ip(self, guest_name):
         """
-        Get guest ip by mac
+        Get the guest ip by asking the libvirt management plane for the
+        guest's current address: the qemu guest agent first (it does not
+        depend on the ARP cache), the hypervisor's ARP table as the
+        fallback for guests without an agent. This replaces the former
+        nmap -sP subnet scan, which needed nmap installed on the
+        hypervisor and walked the whole subnet to match the guest MAC.
+        The guest name is untrusted input: it rides the ssh session's
+        stdin into a fixed remote command, never the command string.
         :param guest_name: name for the specific guest
-        :return:
+        :return: the guest ip, or None when it cannot be discovered
         """
-        gateway = self.get_gateway(self.server)
-        guest_mac = self.get_guest_mac(guest_name)
-        if gateway and guest_mac:
-            option = "grep 'Nmap scan report for' | grep -Eo '([0-9]{1,3}[\.]){3}[0-9]{1,3}'| tail -1"
-            cmd = f"nmap -sP -n {gateway} | grep -i -B 2 {guest_mac} | {option}"
-            ret, output = self.ssh.runcmd(cmd, if_stdout=True)
-            if not ret and output is not None and output != "":
-                guest_ip = output.strip()
-                logger.info(f"Succeeded to get libvirt guest ip ({guest_ip})")
-                return guest_ip
-            else:
-                logger.error("Failed to get libvirt guest ip")
-                return None
+        for source in ("agent", "arp"):
+            # Fixed command string: the remote shell expands "$dom",
+            # the local side never interpolates the guest name.
+            cmd = f'read -r dom; virsh domifaddr "$dom" --source {source}'
+            try:
+                ret, output = self.ssh.runcmd(
+                    cmd,
+                    if_stdout=True,
+                    input_text=f"{guest_name}\n",
+                    timeout=60,
+                )
+            except FailException:
+                # A timed-out source is a failed discovery, not a run
+                # abort: try the fallback, then report no ip.
+                continue
+            ip = first_ipv4(output)
+            if ip:
+                logger.info(
+                    f"Succeeded to get libvirt({self.server}) guest ip "
+                    f"({ip}) via domifaddr --source {source}"
+                )
+                return ip
+        logger.error(f"Failed to get libvirt({self.server}) guest ip")
         return None
 
     def get_gateway(self, host_ip):

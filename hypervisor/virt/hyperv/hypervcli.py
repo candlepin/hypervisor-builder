@@ -1,8 +1,9 @@
 import json
 import re
 
-from hypervisor import logger
+from hypervisor import FailException, logger
 from hypervisor.ssh import SSHConnect
+from hypervisor.virt import first_ipv4
 
 
 class HypervCLI:
@@ -78,13 +79,40 @@ class HypervCLI:
 
     def guest_ip(self, guest_name):
         """
-        Get ip for hyperv guest
+        Get the ip for the hyperv guest. The guest name is untrusted
+        input: it rides the ssh session's stdin into a fixed PowerShell
+        command ([Console]::In), never the command string. -VMName
+        treats wildcard characters as patterns, so the adapter list is
+        post-filtered by the exact VM name (a name containing * or ?
+        must not match a different VM). The filter compares the
+        adapter's VMName, not its Name: Name is the NIC name
+        ("Network Adapter" by default), which never equals the VM name
+        on default-configured guests. The first IPv4 is returned; IPv6
+        and loopback addresses are ignored.
         :param guest_name: the guest name for hyperv guest
-        :return: the ip for hyperv guest
+        :return: the first IPv4 for the guest, or None
         """
-        cmd = f"PowerShell (Get-VMNetworkAdapter -VMName {guest_name}).IpAddresses"
-        ret, output = self.ssh.runcmd(cmd)
-        return output.split()[0] if output else None
+        # Fixed command string: the remote PowerShell expands $n, the
+        # local side never interpolates the guest name.
+        cmd = (
+            'PowerShell -Command "$n=[Console]::In.ReadToEnd().Trim(); '
+            "(Get-VMNetworkAdapter -VMName $n | Where-Object VMName -eq $n)"
+            '.IpAddresses"'
+        )
+        try:
+            ret, output = self.ssh.runcmd(
+                cmd, if_stdout=True, input_text=f"{guest_name}\n", timeout=60
+            )
+        except FailException:
+            # A timed-out query is a failed discovery, not a run abort.
+            logger.error(f"Failed to get hyperv({self.server}) guest ip")
+            return None
+        ip = first_ipv4(output)
+        if ip:
+            logger.info(f"Succeeded to get hyperv({self.server}) guest ip ({ip})")
+            return ip
+        logger.error(f"Failed to get hyperv({self.server}) guest ip")
+        return None
 
     def guest_uuid(self):
         """

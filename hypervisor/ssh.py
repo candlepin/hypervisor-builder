@@ -1,8 +1,10 @@
+import contextlib
 import os
+import socket
 
 import paramiko
 
-from hypervisor import logger
+from hypervisor import FailException, logger
 
 
 class SSHConnect:
@@ -24,16 +26,43 @@ class SSHConnect:
         self.port = port
         self.timeout = timeout
         self.err = "passwd, rsafile, or ssh-agent must be available"
+        self._ssh = None
 
     def _connect(self):
-        """SSH command execution connection"""
+        """SSH command execution connection with pooling.
+        Reuses an existing connection while its transport is still
+        active, avoiding the overhead of a new TCP+SSH handshake per
+        command. Paramiko channels are independent, so consecutive
+        exec_command calls share one transport safely.
+        """
+        if self._ssh is not None:
+            transport = self._ssh.get_transport()
+            if transport is not None and transport.is_active():
+                return self._ssh
+            # Dead transport: close the socket instead of just
+            # dropping the reference.
+            self.close()
         if self.pwd:
-            return self.pwd_connect()
+            self._ssh = self.pwd_connect()
         elif self.rsa:
-            return self.rsa_connect()
+            self._ssh = self.rsa_connect()
         else:
             # Try to use keys from SSH AutoAgent
-            return self.pwd_connect()
+            self._ssh = self.pwd_connect()
+        return self._ssh
+
+    def close(self):
+        """Explicitly close the pooled connection."""
+        if self._ssh is not None:
+            with contextlib.suppress(OSError):
+                self._ssh.close()
+            self._ssh = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        self.close()
 
     def _transfer(self):
         """Sftp download/upload execution connection"""
@@ -90,17 +119,68 @@ class SSHConnect:
         sftp = paramiko.SFTPClient.from_transport(transport)
         return sftp, transport
 
-    def runcmd(self, cmd, if_stdout=False):
+    def runcmd(self, cmd, if_stdout=False, timeout=None, input_text=None):
         """Executes SSH command on remote hostname.
         :param str cmd: The command to run
         :param str if_stdout: default to return the stderr
+        :param int timeout: time in seconds to wait for the command to
+            finish (default: None for no timeout)
+        :param str input_text: text written to the remote command's
+            stdin (default: None for no input). Pass untrusted values
+            here instead of interpolating them into the command string.
+        :return: the exit code and the decoded output of the command
         """
         ssh = self._connect()
         logger.info(f">>> {cmd}")
-        stdin, stdout, stderr = ssh.exec_command(cmd)
-        code = stdout.channel.recv_exit_status()
-        stdout, stderr = stdout.read(), stderr.read()
-        ssh.close()
+        try:
+            stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+        except (EOFError, OSError, paramiko.SSHException):
+            # The pooled transport dropped before the command could
+            # start: close the dead connection, reconnect once and
+            # start the command again.
+            self.close()
+            ssh = self._connect()
+            stdin, stdout, stderr = ssh.exec_command(cmd, timeout=timeout)
+        try:
+            if input_text is not None:
+                stdin.write(input_text)
+                stdin.flush()
+            # Close the write side so a remote command reading stdin
+            # sees EOF instead of hanging.
+            stdin.channel.shutdown_write()
+        except (EOFError, OSError, paramiko.SSHException):
+            # The command may already be running remotely: starting it
+            # again could double-execute a non-idempotent command, so
+            # do not retry. Drop the dead connection (the next call
+            # reconnects) and let the failure propagate.
+            self.close()
+            raise
+
+        if timeout is not None:
+            stdout.channel.settimeout(timeout)
+
+        try:
+            # Bound the exit-status wait itself: recv_exit_status()
+            # is an unbounded status_event.wait() that the channel
+            # timeout does not cover, so a hung remote command would
+            # block forever. False means the status never arrived --
+            # take the shared timeout path below.
+            if timeout is not None and not stdout.channel.status_event.wait(timeout):
+                raise TimeoutError()
+            code = stdout.channel.recv_exit_status()
+            stdout, stderr = stdout.read(), stderr.read()
+        except (TimeoutError, socket.timeout):  # noqa: UP041
+            # socket.timeout is a distinct class from TimeoutError on
+            # Python < 3.10: catching only the latter let a channel
+            # timeout surface as a raw traceback there. (UP041 wants
+            # the alias dropped -- it only IS an alias on 3.10+, and
+            # consumers run older Pythons.)
+            logger.error(f"Command execution timed out after {timeout} seconds: {cmd}")
+            self.close()
+            raise FailException(
+                f"Command timed out after {timeout} seconds: {cmd}"
+            ) from None
+
         if if_stdout or not stderr:
             logger.info(f"<<< stdout\n{stdout.decode()}")
             return code, stdout.decode()
@@ -121,6 +201,14 @@ class SSHConnect:
         """
         sftp, conn = self._transfer()
         sftp.put(local_file, remote_file)
+        conn.close()
+
+    def remove_file(self, remote_file):
+        """Remove the file at the given path.
+        :param remote_file: a remote file path to remove
+        """
+        sftp, conn = self._transfer()
+        sftp.remove(remote_file)
         conn.close()
 
     def put_dir(self, local_dir, remote_dir):
