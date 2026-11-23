@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      # Pinned for determinism (test-only job): requirements.txt
+      # carries the legacy supported vintage -- pytest 6.2.2 predates
+      # Python 3.12 and paramiko 2.7.2 will not install there -- so
+      # this job runs a modern set instead. The tests are network-free
+      # (the paramiko and ssh layers are faked).
+      - run: pip install 'pytest==8.*' 'paramiko==3.*'
+      - run: pytest
