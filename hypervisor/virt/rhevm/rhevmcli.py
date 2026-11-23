@@ -166,7 +166,10 @@ class RHEVMCLI:
         guest_mac = self.get_guest_mac(guest_name)
         option = "grep 'Nmap scan report for' | grep -Eo '([0-9]{1,3}[\.]){3}[0-9]{1,3}'| tail -1"
         cmd = f"nmap -sP -n {gateway} | grep -i -B 2 {guest_mac} | {option}"
-        ret, output = SSHConnect(host_ip, host_user, host_pwd).runcmd(cmd)
+        # One-shot connection: closing it keeps the pooled session
+        # from outliving the call.
+        with SSHConnect(host_ip, host_user, host_pwd) as ssh:
+            ret, output = ssh.runcmd(cmd)
         if not ret and output is not None and output != "":
             guest_ip = output.strip()
             logger.info(f"Succeeded to get rhevm guest ip ({guest_ip})")
@@ -183,7 +186,10 @@ class RHEVMCLI:
         :return: the gateway for host
         """
         cmd = f"ip route | grep {host_ip}"
-        ret, output = SSHConnect(host_ip, host_user, host_pwd).runcmd(cmd)
+        # One-shot connection: closing it keeps the pooled session
+        # from outliving the call.
+        with SSHConnect(host_ip, host_user, host_pwd) as ssh:
+            ret, output = ssh.runcmd(cmd)
         if not ret and output is not None and output != "":
             output = output.strip().split(" ")
             if len(output) > 0:
